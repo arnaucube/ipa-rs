@@ -1,8 +1,8 @@
 extern crate ark_ed_on_bn254;
 use ark_ec::ProjectiveCurve;
 use ark_ed_on_bn254::{EdwardsProjective, Fr};
-use ark_ff::{fields::PrimeField, Field}; // BigInteger
-use ark_std::{UniformRand, Zero};
+use ark_ff::{fields::PrimeField, Field};
+use ark_std::{One, UniformRand, Zero};
 
 #[allow(non_snake_case)]
 pub struct IPA {
@@ -15,8 +15,6 @@ pub struct IPA {
 #[allow(non_snake_case)]
 pub struct Proof {
     a: Fr,
-    b: Fr,                // TODO not needed
-    G: EdwardsProjective, // TODO not needed
     l: Vec<Fr>,
     r: Vec<Fr>,
     L: Vec<EdwardsProjective>,
@@ -42,11 +40,17 @@ impl IPA {
         }
     }
 
-    pub fn commit(&self, a: &[Fr], r: Fr) -> EdwardsProjective {
-        inner_product_point(a, &self.Gs) + self.H.mul(r.into_repr())
+    pub fn commit(&self, a: &[Fr], r: Fr) -> Result<EdwardsProjective, String> {
+        Ok(inner_product_point(a, &self.Gs)? + self.H.mul(r.into_repr()))
     }
 
-    pub fn ipa(&mut self, a: &[Fr], b: &[Fr], u: &[Fr], U: &EdwardsProjective) -> Proof {
+    pub fn ipa(
+        &mut self,
+        a: &[Fr],
+        b: &[Fr],
+        u: &[Fr],
+        U: &EdwardsProjective,
+    ) -> Result<Proof, String> {
         let mut a = a.to_owned();
         let mut b = b.to_owned();
         let mut G = self.Gs.clone();
@@ -69,12 +73,12 @@ impl IPA {
             l[j] = Fr::rand(&mut self.rng);
             r[j] = Fr::rand(&mut self.rng);
 
-            L[j] = inner_product_point(&a_lo, &G_hi)
+            L[j] = inner_product_point(&a_lo, &G_hi)?
                 + self.H.mul(l[j].into_repr())
-                + U.mul(inner_product_field(&a_lo, &b_hi).into_repr());
-            R[j] = inner_product_point(&a_hi, &G_lo)
+                + U.mul(inner_product_field(&a_lo, &b_hi)?.into_repr());
+            R[j] = inner_product_point(&a_hi, &G_lo)?
                 + self.H.mul(r[j].into_repr())
-                + U.mul(inner_product_field(&a_hi, &b_lo).into_repr());
+                + U.mul(inner_product_field(&a_hi, &b_lo)?.into_repr());
 
             let uj = u[j];
             let uj_inv = u[j].inverse().unwrap();
@@ -82,41 +86,52 @@ impl IPA {
             a = vec_add(
                 &vec_scalar_mul_field(&a_lo, &uj),
                 &vec_scalar_mul_field(&a_hi, &uj_inv),
-            );
+            )?;
             b = vec_add(
                 &vec_scalar_mul_field(&b_lo, &uj_inv),
                 &vec_scalar_mul_field(&b_hi, &uj),
-            );
+            )?;
             G = vec_add_point(
                 &vec_scalar_mul_point(&G_lo, &uj_inv),
                 &vec_scalar_mul_point(&G_hi, &uj),
-            );
+            )?;
         }
 
-        // TODO assert len a,b,G == 1
+        if a.len() != 1 {
+            return Err(format!("a.len() should be 1, a.len()={}", a.len()));
+        }
+        if b.len() != 1 {
+            return Err(format!("b.len() should be 1, b.len()={}", b.len()));
+        }
+        if G.len() != 1 {
+            return Err(format!("G.len() should be 1, G.len()={}", G.len()));
+        }
 
-        Proof {
+        Ok(Proof {
             a: a[0],
-            b: b[0],
-            G: G[0],
             l,
             r,
             L,
             R,
-        }
+        })
     }
     pub fn verify(
         &self,
+        x: &Fr,
         P: &EdwardsProjective,
         p: &Proof,
         r: &Fr,
         u: &[Fr],
         U: &EdwardsProjective,
-    ) -> bool {
+    ) -> Result<bool, String> {
         let mut q_0 = *P;
         let mut r = *r;
 
-        // TODO compute b & G without getting them in the proof package
+        // compute b & G from s
+        let s = build_s(u, self.d as usize);
+        let bs = powers_of(*x, self.d);
+        let b = inner_product_field(&s, &bs)?;
+        let G = inner_product_point(&s, &self.Gs)?;
 
         #[allow(clippy::needless_range_loop)]
         for j in 0..u.len() {
@@ -127,46 +142,103 @@ impl IPA {
             r = r + p.l[j] * uj2 + p.r[j] * uj_inv2;
         }
 
-        let q_1 =
-            p.G.mul(p.a.into_repr()) + self.H.mul(r.into_repr()) + U.mul((p.a * p.b).into_repr());
+        let q_1 = G.mul(p.a.into_repr()) + self.H.mul(r.into_repr()) + U.mul((p.a * b).into_repr());
 
-        q_0 == q_1
+        Ok(q_0 == q_1)
     }
 }
 
-fn inner_product_field(a: &[Fr], b: &[Fr]) -> Fr {
-    // TODO require lens equal
+// s = (
+//   u₁⁻¹ u₂⁻¹ … uₖ⁻¹,
+//   u₁   u₂⁻¹ … uₖ⁻¹,
+//   u₁⁻¹ u₂   … uₖ⁻¹,
+//   u₁   u₂   … uₖ⁻¹,
+//   ⋮    ⋮      ⋮
+//   u₁   u₂   … uₖ
+// )
+fn build_s(u: &[Fr], d: usize) -> Vec<Fr> {
+    let k = (f64::from(d as u32).log2()) as usize;
+    let mut s: Vec<Fr> = vec![Fr::one(); d];
+    let mut t = d;
+    for j in (0..k).rev() {
+        t /= 2;
+        let mut c = 0;
+        #[allow(clippy::needless_range_loop)]
+        for i in 0..d {
+            if c < t {
+                s[i] *= u[j].inverse().unwrap();
+            } else {
+                s[i] *= u[j];
+            }
+            c += 1;
+            if c >= t * 2 {
+                c = 0;
+            }
+        }
+    }
+    s
+}
+
+fn inner_product_field(a: &[Fr], b: &[Fr]) -> Result<Fr, String> {
+    if a.len() != b.len() {
+        return Err(format!(
+            "a.len()={} must be equal to b.len()={}",
+            a.len(),
+            b.len()
+        ));
+    }
     let mut c: Fr = Fr::zero();
     for i in 0..a.len() {
         c += a[i] * b[i];
     }
-    c
+    Ok(c)
 }
 
-fn inner_product_point(a: &[Fr], b: &[EdwardsProjective]) -> EdwardsProjective {
-    // TODO require lens equal
+fn inner_product_point(a: &[Fr], b: &[EdwardsProjective]) -> Result<EdwardsProjective, String> {
+    if a.len() != b.len() {
+        return Err(format!(
+            "a.len()={} must be equal to b.len()={}",
+            a.len(),
+            b.len()
+        ));
+    }
     let mut c: EdwardsProjective = EdwardsProjective::zero();
     for i in 0..a.len() {
         c += b[i].mul(a[i].into_repr());
     }
-    c
+    Ok(c)
 }
 
-fn vec_add(a: &[Fr], b: &[Fr]) -> Vec<Fr> {
-    // TODO require len equal
+fn vec_add(a: &[Fr], b: &[Fr]) -> Result<Vec<Fr>, String> {
+    if a.len() != b.len() {
+        return Err(format!(
+            "a.len()={} must be equal to b.len()={}",
+            a.len(),
+            b.len()
+        ));
+    }
     let mut c: Vec<Fr> = vec![Fr::zero(); a.len()];
     for i in 0..a.len() {
         c[i] = a[i] + b[i];
     }
-    c
+    Ok(c)
 }
-fn vec_add_point(a: &[EdwardsProjective], b: &[EdwardsProjective]) -> Vec<EdwardsProjective> {
-    // TODO require len equal
+fn vec_add_point(
+    a: &[EdwardsProjective],
+    b: &[EdwardsProjective],
+) -> Result<Vec<EdwardsProjective>, String> {
+    if a.len() != b.len() {
+        return Err(format!(
+            "a.len()={} must be equal to b.len()={}",
+            a.len(),
+            b.len()
+        ));
+    }
     let mut c: Vec<EdwardsProjective> = vec![EdwardsProjective::zero(); a.len()];
     for i in 0..a.len() {
         c[i] = a[i] + b[i];
     }
-    c
+    Ok(c)
 }
 
 fn vec_scalar_mul_field(a: &[Fr], b: &Fr) -> Vec<Fr> {
@@ -184,25 +256,14 @@ fn vec_scalar_mul_point(a: &[EdwardsProjective], b: &Fr) -> Vec<EdwardsProjectiv
     c
 }
 
-#[allow(dead_code)]
 fn powers_of(x: Fr, d: u32) -> Vec<Fr> {
     let mut c: Vec<Fr> = vec![Fr::zero(); d as usize];
     c[0] = x;
     for i in 1..d as usize {
-        // TODO redo better
         c[i] = c[i - 1] * x;
     }
     c
 }
-
-// fn inner_product<T>(a: Vec<T>, b: Vec<T>) -> T {
-//     // require lens equal
-//     let mut c: T = Zero();
-//     for i in 0..a.len() {
-//         c = c + a[i] * b[i];
-//     }
-//     c
-// }
 
 #[cfg(test)]
 #[allow(non_snake_case)]
@@ -211,12 +272,6 @@ mod tests {
 
     #[test]
     fn test_utils() {
-        // let a = Fr::from(1 as u32);
-        // let b = Fr::one();
-        // println!("A: {:?}", Fr::from(1 as u32));
-        // println!("A: {:?}", a);
-        // println!("B: {:?}", b);
-
         let a = vec![
             Fr::from(1 as u32),
             Fr::from(2 as u32),
@@ -229,15 +284,41 @@ mod tests {
             Fr::from(3 as u32),
             Fr::from(4 as u32),
         ];
-        let c = inner_product_field(&a, &b);
-        println!("c: {:?}", c);
-
-        // let result = 2 + 2;
-        // assert_eq!(result, 4);
+        let c = inner_product_field(&a, &b).unwrap();
+        assert_eq!(c, Fr::from(30 as u32));
     }
 
     #[test]
-    fn test_inner_product() {
+    fn test_homomorphic_property() {
+        let d = 8;
+        let ipa = IPA::new(d);
+
+        let a = vec![
+            Fr::from(1 as u32),
+            Fr::from(2 as u32),
+            Fr::from(3 as u32),
+            Fr::from(4 as u32),
+            Fr::from(5 as u32),
+            Fr::from(6 as u32),
+            Fr::from(7 as u32),
+            Fr::from(8 as u32),
+        ];
+        let b = a.clone();
+
+        let mut rng = ark_std::rand::thread_rng();
+        let r = Fr::rand(&mut rng);
+        let s = Fr::rand(&mut rng);
+
+        let vc_a = ipa.commit(&a, r).unwrap();
+        let vc_b = ipa.commit(&b, s).unwrap();
+
+        let expected_vc_c = ipa.commit(&vec_add(&a, &b).unwrap(), r + s).unwrap();
+        let vc_c = vc_a + vc_b;
+        assert_eq!(vc_c, expected_vc_c);
+    }
+
+    #[test]
+    fn test_inner_product_argument_proof() {
         let d = 8;
         let mut ipa = IPA::new(d);
 
@@ -257,8 +338,8 @@ mod tests {
 
         let r = Fr::rand(&mut ipa.rng);
 
-        let mut P = ipa.commit(&a, r);
-        let v = inner_product_field(&a, &b);
+        let mut P = ipa.commit(&a, r).unwrap();
+        let v = inner_product_field(&a, &b).unwrap();
 
         let U = EdwardsProjective::rand(&mut ipa.rng);
 
@@ -270,8 +351,8 @@ mod tests {
 
         P = P + U.mul(v.into_repr());
 
-        let proof = ipa.ipa(&a, &b, &u, &U);
-        let verif = ipa.verify(&P, &proof, &r, &u, &U);
+        let proof = ipa.ipa(&a, &b, &u, &U).unwrap();
+        let verif = ipa.verify(&x, &P, &proof, &r, &u, &U).unwrap();
         assert!(verif);
     }
 }
