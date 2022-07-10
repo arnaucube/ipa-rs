@@ -44,7 +44,7 @@ impl IPA {
         Ok(inner_product_point(a, &self.Gs)? + self.H.mul(r.into_repr()))
     }
 
-    pub fn ipa(
+    pub fn prove(
         &mut self,
         a: &[Fr],
         b: &[Fr],
@@ -118,13 +118,16 @@ impl IPA {
     pub fn verify(
         &self,
         x: &Fr,
+        v: &Fr,
         P: &EdwardsProjective,
         p: &Proof,
         r: &Fr,
         u: &[Fr],
         U: &EdwardsProjective,
     ) -> Result<bool, String> {
-        let mut q_0 = *P;
+        let P = *P + U.mul(v.into_repr());
+
+        let mut q_0 = P;
         let mut r = *r;
 
         // compute b & G from s
@@ -333,26 +336,27 @@ mod tests {
             Fr::from(8 as u32),
         ];
 
-        let x = Fr::from(3 as u32);
-        let b = powers_of(x, ipa.d);
-
         let r = Fr::rand(&mut ipa.rng);
 
-        let mut P = ipa.commit(&a, r).unwrap();
-        let v = inner_product_field(&a, &b).unwrap();
+        // prover commits
+        let P = ipa.commit(&a, r).unwrap();
 
+        // verifier sets challenges
         let U = EdwardsProjective::rand(&mut ipa.rng);
-
         let k = (f64::from(ipa.d as u32).log2()) as usize;
         let mut u: Vec<Fr> = vec![Fr::zero(); k];
         for j in 0..k {
             u[j] = Fr::rand(&mut ipa.rng);
         }
+        let x = Fr::from(3 as u32);
 
-        P = P + U.mul(v.into_repr());
+        // prover opens at the challenges
+        let b = powers_of(x, ipa.d);
+        let v = inner_product_field(&a, &b).unwrap();
+        let proof = ipa.prove(&a, &b, &u, &U).unwrap();
 
-        let proof = ipa.ipa(&a, &b, &u, &U).unwrap();
-        let verif = ipa.verify(&x, &P, &proof, &r, &u, &U).unwrap();
+        // verifier
+        let verif = ipa.verify(&x, &v, &P, &proof, &r, &u, &U).unwrap();
         assert!(verif);
     }
 }
